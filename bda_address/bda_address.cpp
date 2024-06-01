@@ -180,7 +180,7 @@ void Parse(const std::vector<uint32_t>& spirv) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cout << "Usage:\n\tbda_address input.spv\n";
+        std::cout << "Usage:\n\t" << argv[0] << " input.spv\n";
         return EXIT_FAILURE;
     } else if (!std::filesystem::exists(argv[1])) {
         std::cout << "ERROR: " << argv[1] << " Does not exists\n";
