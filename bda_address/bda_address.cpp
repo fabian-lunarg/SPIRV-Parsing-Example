@@ -113,6 +113,36 @@ void Parse(const std::vector<uint32_t>& spirv) {
     std::vector<const Instruction*> store_instructions;
     std::vector<const Instruction*> decorations_instructions;
 
+    auto track_back_instruction = [&store_instructions, &decorations_instructions](const Instruction* object_insn) {
+        // We are where a buffer-reference was accessed, now walk back to find where it came from
+        while (object_insn) {
+            switch (object_insn->Opcode()) {
+                case spv::OpConvertUToPtr:
+                case spv::OpCopyLogical:
+                case spv::OpLoad:
+                case spv::OpAccessChain:
+                    object_insn = FindDef(object_insn->Operand(0));
+                    break;
+                case spv::OpVariable: {
+                    const uint32_t storage_class = object_insn->Operand(0);
+                    if (storage_class == spv::StorageClassFunction) {
+                        // When casting to a struct, can get a 2nd function variable, just keep following
+                        object_insn = FindVariableStoring(store_instructions, object_insn->ResultId());
+                    } else {
+                        PrintVariableDecorations(decorations_instructions, *object_insn);
+                        object_insn = nullptr;
+                    }
+                    break;
+                }
+                default:
+                    printf("Failed to track back the Function Variable OpStore, hit a %s\n",
+                           string_SpvOpcode(object_insn->Opcode()));
+                    object_insn = nullptr;
+                    break;
+            }
+        }
+    };
+
     // Now we can walk the SPIR-V one more time to find what we need
     for (const Instruction& insn : instructions) {
         // because it is SSA, we can build this up as we are looping in this pass
@@ -147,33 +177,9 @@ void Parse(const std::vector<uint32_t>& spirv) {
             const Instruction* object_insn = FindVariableStoring(store_instructions, load_pointer_insn->ResultId());
             if (!object_insn) continue;
 
-            // We where the address was stored to this variable, now walk back to find where it came from
-            while (object_insn) {
-                switch (object_insn->Opcode()) {
-                    case spv::OpConvertUToPtr:
-                    case spv::OpCopyLogical:
-                    case spv::OpLoad:
-                    case spv::OpAccessChain:
-                        object_insn = FindDef(object_insn->Operand(0));
-                        break;
-                    case spv::OpVariable: {
-                        const uint32_t storage_class = object_insn->Operand(0);
-                        if (storage_class == spv::StorageClassFunction) {
-                            // When casting to a struct, can get a 2nd function variable, just keep following
-                            object_insn = FindVariableStoring(store_instructions, object_insn->ResultId());
-                        } else {
-                            PrintVariableDecorations(decorations_instructions, *object_insn);
-                            object_insn = nullptr;
-                        }
-                        break;
-                    }
-                    default:
-                        printf("Failed to track back the Function Variable OpStore, hit a %s\n",
-                               string_SpvOpcode(object_insn->Opcode()));
-                        object_insn = nullptr;
-                        break;
-                }
-            }
+            track_back_instruction(object_insn);
+        } else if (load_pointer_insn && load_pointer_insn->Opcode() == spv::OpAccessChain) {
+            track_back_instruction(load_pointer_insn);
         }
     }
 }
