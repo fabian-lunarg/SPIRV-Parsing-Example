@@ -3,9 +3,14 @@
 #include <vector>
 #include <unordered_map>
 #include <chrono>
+#include <optional>
+#include <functional>
+#include <deque>
 
 #include "helper.h"
 #include "spirv.hpp"
+
+#include "spirv_reflect.h"
 
 // Represents a single Spv::Op instruction
 class Instruction {
@@ -72,40 +77,55 @@ const Instruction* FindVariableStoring(std::vector<const Instruction*>& store_in
     return nullptr;
 }
 
-void PrintVariableDecorations(std::vector<const Instruction*>& decorations_instructions, const Instruction& variable_insn) {
+struct descriptor_binding_info_t {
+    uint32_t set = 0;
+    uint32_t binding = 0;
+    uint32_t variable_id = 0;
+};
+
+std::optional<descriptor_binding_info_t> GetVariableDecorations(std::vector<const Instruction*>& decorations_instructions,
+                                                                const Instruction& variable_insn) {
     const uint32_t variable_id = variable_insn.ResultId();
     const uint32_t storage_class = variable_insn.Operand(0);
     if (storage_class == spv::StorageClassPushConstant) {
         printf("Address from Push Constant block\n");
-        return;
+        return {};
     }
 
-    uint32_t set = 0;
-    uint32_t binding = 0;
+    descriptor_binding_info_t binding_info;
+    binding_info.variable_id = variable_id;
+
     for (const Instruction* insn : decorations_instructions) {
         if (insn->Operand(0) != variable_id) continue;
         if (insn->Operand(1) == spv::DecorationDescriptorSet) {
-            set = insn->Operand(2);
+            binding_info.set = insn->Operand(2);
         } else if (insn->Operand(1) == spv::DecorationBinding) {
-            binding = insn->Operand(2);
+            binding_info.binding = insn->Operand(2);
         }
     }
 
     if (storage_class == spv::StorageClassStorageBuffer || storage_class == spv::StorageClassUniform) {
-        printf("Address from Descriptor in Set %u, Binding %u\n", set, binding);
+        return binding_info;
     } else {
         printf("Storage class %u not handled\n", storage_class);
+        return {};
     }
 }
 
 void Parse(const std::vector<uint32_t>& spirv) {
+    // use in combination with spirv-reflect
+    std::unique_ptr<SpvReflectShaderModule, std::function<void(SpvReflectShaderModule*)>> spv_shader_module = {
+        new SpvReflectShaderModule, spvReflectDestroyShaderModule};
+
+    spvReflectCreateShaderModule(spirv.size() * sizeof(uint32_t), spirv.data(), spv_shader_module.get());
+
     std::vector<uint32_t>::const_iterator it = spirv.cbegin();
     it += 5;  // skip first 5 word of header
 
     std::vector<Instruction> instructions;
     // First build up instructions object to make it easier to work with the SPIR-V
     while (it != spirv.cend()) {
-        Instruction insn = instructions.emplace_back((it));
+        Instruction& insn = instructions.emplace_back((it));
         it += insn.Length();
     }
     instructions.shrink_to_fit();
@@ -113,7 +133,8 @@ void Parse(const std::vector<uint32_t>& spirv) {
     std::vector<const Instruction*> store_instructions;
     std::vector<const Instruction*> decorations_instructions;
 
-    auto track_back_instruction = [&store_instructions, &decorations_instructions](const Instruction* object_insn) {
+    auto track_back_instruction = [&spv_shader_module, &store_instructions,
+                                   &decorations_instructions](const Instruction* object_insn) {
         // We are where a buffer-reference was accessed, now walk back to find where it came from
         while (object_insn) {
             switch (object_insn->Opcode()) {
@@ -129,7 +150,30 @@ void Parse(const std::vector<uint32_t>& spirv) {
                         // When casting to a struct, can get a 2nd function variable, just keep following
                         object_insn = FindVariableStoring(store_instructions, object_insn->ResultId());
                     } else {
-                        PrintVariableDecorations(decorations_instructions, *object_insn);
+                        if (auto binding_info = GetVariableDecorations(decorations_instructions, *object_insn)) {
+                            SpvReflectResult spv_result;
+                            auto spv_descriptor_binding = spvReflectGetDescriptorBinding(
+                                spv_shader_module.get(), binding_info->binding, binding_info->set, &spv_result);
+
+                            printf("address from Descriptor in Set %u, Binding %u\n", binding_info->set, binding_info->binding);
+
+                            // bfs all members
+                            std::deque<const SpvReflectTypeDescription*> queue{spv_descriptor_binding->type_description};
+
+                            while (!queue.empty()) {
+                                auto type_desc = queue.front();
+                                queue.pop_front();
+
+                                if (type_desc->op == SpvOpTypeForwardPointer ||
+                                    (type_desc->op == SpvOpTypeInt && type_desc->traits.numeric.scalar.width == 64)) {
+                                    printf("struct_member_name: %s\n", type_desc->struct_member_name);
+                                }
+
+                                for (uint32_t m = 0; m < type_desc->member_count; ++m) {
+                                    queue.push_back(type_desc->members + m);
+                                }
+                            }
+                        }
                         object_insn = nullptr;
                     }
                     break;
@@ -172,6 +216,7 @@ void Parse(const std::vector<uint32_t>& spirv) {
         }
 
         const Instruction* load_pointer_insn = FindDef(insn.Operand(0));
+
         if (load_pointer_insn && load_pointer_insn->Opcode() == spv::OpVariable &&
             load_pointer_insn->Operand(0) == spv::StorageClassFunction) {
             const Instruction* object_insn = FindVariableStoring(store_instructions, load_pointer_insn->ResultId());
