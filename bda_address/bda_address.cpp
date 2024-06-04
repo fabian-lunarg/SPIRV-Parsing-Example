@@ -6,6 +6,7 @@
 #include <optional>
 #include <functional>
 #include <deque>
+#include <map>
 #include <cassert>
 
 #include "helper.h"
@@ -134,7 +135,11 @@ void Parse(const std::vector<uint32_t>& spirv) {
     std::vector<const Instruction*> store_instructions;
     std::vector<const Instruction*> decorations_instructions;
 
-    auto track_back_instruction = [&spv_shader_module, &store_instructions, &decorations_instructions](
+    // set/binding/offset
+    using buffer_ref_key_t = std::tuple<uint32_t, uint32_t, uint32_t>;
+    std::map<buffer_ref_key_t, std::string> buffer_references;
+
+    auto track_back_instruction = [&buffer_references, &spv_shader_module, &store_instructions, &decorations_instructions](
                                       const Instruction* object_insn, uint32_t type_id) {
         // keep track of access-chain
         std::vector<uint32_t> access_indices;
@@ -180,16 +185,15 @@ void Parse(const std::vector<uint32_t>& spirv) {
                                 for (uint32_t m = 0; m < idx; ++m) {
                                     uint32_t num_scalar_bytes = 0;
                                     const auto& member = td->members[m];
-                                    auto& traits = member.traits;
-                                    num_scalar_bytes = traits.numeric.scalar.width / 8;
+                                    num_scalar_bytes = member.traits.numeric.scalar.width / 8;
 
                                     if (member.op == SpvOpTypeVector) {
-                                        num_scalar_bytes *= traits.numeric.vector.component_count;
+                                        num_scalar_bytes *= member.traits.numeric.vector.component_count;
                                     } else if (member.op == SpvOpTypeMatrix) {
-                                        num_scalar_bytes *= traits.numeric.matrix.column_count;
-                                        num_scalar_bytes *= traits.numeric.matrix.row_count;
-                                        num_scalar_bytes = std::max(num_scalar_bytes, traits.numeric.matrix.stride);
-                                        num_scalar_bytes = std::max(num_scalar_bytes, traits.array.stride);
+                                        num_scalar_bytes *= member.traits.numeric.matrix.column_count;
+                                        num_scalar_bytes *= member.traits.numeric.matrix.row_count;
+                                        num_scalar_bytes = std::max(num_scalar_bytes, member.traits.numeric.matrix.stride);
+                                        num_scalar_bytes = std::max(num_scalar_bytes, member.traits.array.stride);
                                     } else if (member.op == SpvOpTypeForwardPointer) {
                                         num_scalar_bytes = sizeof(uint64_t);
                                     }
@@ -200,12 +204,11 @@ void Parse(const std::vector<uint32_t>& spirv) {
                                 td = td->members + idx;
                             }
 
-                            // TODO: not all uin64_t are buffer-references
                             assert(td->op == SpvOpTypeForwardPointer ||
                                    (td->op == SpvOpTypeInt && td->traits.numeric.scalar.width == 64));
 
-                            printf("buffer-reference: %s (set: %u, binding: %u - buffer-offset: %u)\n", td->struct_member_name,
-                                   binding_info->set, binding_info->binding, buffer_offset);
+                            buffer_ref_key_t key = {binding_info->set, binding_info->binding, buffer_offset};
+                            buffer_references[key] = td->struct_member_name;
                         }
                         object_insn = nullptr;
                     }
@@ -259,6 +262,11 @@ void Parse(const std::vector<uint32_t>& spirv) {
         } else if (load_pointer_insn && load_pointer_insn->Opcode() == spv::OpAccessChain) {
             track_back_instruction(load_pointer_insn, type_pointer_insn->ResultId());
         }
+    }
+
+    for (const auto& [key, name] : buffer_references) {
+        const auto& [set, binding, offset] = key;
+        printf("buffer-reference: %s (set: %u, binding: %u - buffer-offset: %u)\n", name.c_str(), set, binding, offset);
     }
 }
 
