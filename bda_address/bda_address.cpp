@@ -6,6 +6,7 @@
 #include <optional>
 #include <functional>
 #include <deque>
+#include <cassert>
 
 #include "helper.h"
 #include "spirv.hpp"
@@ -40,6 +41,8 @@ class Instruction {
     uint32_t Word(uint32_t index) const { return words_[index]; }
     // Skips pass any optional Result or Result Type word
     uint32_t Operand(uint32_t index) const { return words_[operand_index_ + index]; }
+
+    uint32_t num_operands() const { return Length() - operand_index_; }
 
     uint32_t Length() const { return words_[0] >> 16; }
 
@@ -80,7 +83,6 @@ const Instruction* FindVariableStoring(std::vector<const Instruction*>& store_in
 struct descriptor_binding_info_t {
     uint32_t set = 0;
     uint32_t binding = 0;
-    uint32_t variable_id = 0;
 };
 
 std::optional<descriptor_binding_info_t> GetVariableDecorations(std::vector<const Instruction*>& decorations_instructions,
@@ -93,7 +95,6 @@ std::optional<descriptor_binding_info_t> GetVariableDecorations(std::vector<cons
     }
 
     descriptor_binding_info_t binding_info;
-    binding_info.variable_id = variable_id;
 
     for (const Instruction* insn : decorations_instructions) {
         if (insn->Operand(0) != variable_id) continue;
@@ -133,17 +134,31 @@ void Parse(const std::vector<uint32_t>& spirv) {
     std::vector<const Instruction*> store_instructions;
     std::vector<const Instruction*> decorations_instructions;
 
-    auto track_back_instruction = [&spv_shader_module, &store_instructions,
-                                   &decorations_instructions](const Instruction* object_insn) {
+    auto track_back_instruction = [&spv_shader_module, &store_instructions, &decorations_instructions](
+                                      const Instruction* object_insn, uint32_t type_id) {
+        // keep track of access-chain
+        std::vector<uint32_t> access_indices;
+
         // We are where a buffer-reference was accessed, now walk back to find where it came from
         while (object_insn) {
             switch (object_insn->Opcode()) {
                 case spv::OpConvertUToPtr:
                 case spv::OpCopyLogical:
                 case spv::OpLoad:
-                case spv::OpAccessChain:
                     object_insn = FindDef(object_insn->Operand(0));
                     break;
+                case spv::OpAccessChain: {
+                    access_indices.clear();
+
+                    for (uint32_t i = 1; i < object_insn->num_operands(); ++i) {
+                        if (auto ins = FindDef(object_insn->Operand(i))) {
+                            // store resolved indices
+                            access_indices.push_back(ins->Operand(0));
+                        }
+                    }
+                    object_insn = FindDef(object_insn->Operand(0));
+                    break;
+                }
                 case spv::OpVariable: {
                     const uint32_t storage_class = object_insn->Operand(0);
                     if (storage_class == spv::StorageClassFunction) {
@@ -155,24 +170,42 @@ void Parse(const std::vector<uint32_t>& spirv) {
                             auto spv_descriptor_binding = spvReflectGetDescriptorBinding(
                                 spv_shader_module.get(), binding_info->binding, binding_info->set, &spv_result);
 
-                            printf("address from Descriptor in Set %u, Binding %u\n", binding_info->set, binding_info->binding);
+                            const SpvReflectTypeDescription* td = spv_descriptor_binding->type_description;
+                            uint32_t buffer_offset = 0;
 
-                            // bfs all members
-                            std::deque<const SpvReflectTypeDescription*> queue{spv_descriptor_binding->type_description};
+                            for (auto idx : access_indices) {
+                                assert(idx < td->member_count);
 
-                            while (!queue.empty()) {
-                                auto type_desc = queue.front();
-                                queue.pop_front();
+                                // offset calculation
+                                for (uint32_t m = 0; m < idx; ++m) {
+                                    uint32_t num_scalar_bytes = 0;
+                                    const auto& member = td->members[m];
+                                    auto& traits = member.traits;
+                                    num_scalar_bytes = traits.numeric.scalar.width / 8;
 
-                                if (type_desc->op == SpvOpTypeForwardPointer ||
-                                    (type_desc->op == SpvOpTypeInt && type_desc->traits.numeric.scalar.width == 64)) {
-                                    printf("struct_member_name: %s\n", type_desc->struct_member_name);
+                                    if (member.op == SpvOpTypeVector) {
+                                        num_scalar_bytes *= traits.numeric.vector.component_count;
+                                    } else if (member.op == SpvOpTypeMatrix) {
+                                        num_scalar_bytes *= traits.numeric.matrix.column_count;
+                                        num_scalar_bytes *= traits.numeric.matrix.row_count;
+                                        num_scalar_bytes = std::max(num_scalar_bytes, traits.numeric.matrix.stride);
+                                        num_scalar_bytes = std::max(num_scalar_bytes, traits.array.stride);
+                                    } else if (member.op == SpvOpTypeForwardPointer) {
+                                        num_scalar_bytes = sizeof(uint64_t);
+                                    }
+                                    buffer_offset += num_scalar_bytes;
                                 }
 
-                                for (uint32_t m = 0; m < type_desc->member_count; ++m) {
-                                    queue.push_back(type_desc->members + m);
-                                }
+                                // follow access-chain
+                                td = td->members + idx;
                             }
+
+                            // TODO: not all uin64_t are buffer-references
+                            assert(td->op == SpvOpTypeForwardPointer ||
+                                   (td->op == SpvOpTypeInt && td->traits.numeric.scalar.width == 64));
+
+                            printf("buffer-reference: %s (set: %u, binding: %u - buffer-offset: %u)\n", td->struct_member_name,
+                                   binding_info->set, binding_info->binding, buffer_offset);
                         }
                         object_insn = nullptr;
                     }
@@ -222,9 +255,9 @@ void Parse(const std::vector<uint32_t>& spirv) {
             const Instruction* object_insn = FindVariableStoring(store_instructions, load_pointer_insn->ResultId());
             if (!object_insn) continue;
 
-            track_back_instruction(object_insn);
+            track_back_instruction(object_insn, type_pointer_insn->ResultId());
         } else if (load_pointer_insn && load_pointer_insn->Opcode() == spv::OpAccessChain) {
-            track_back_instruction(load_pointer_insn);
+            track_back_instruction(load_pointer_insn, type_pointer_insn->ResultId());
         }
     }
 }
