@@ -139,8 +139,8 @@ void Parse(const std::vector<uint32_t>& spirv) {
     using buffer_ref_key_t = std::tuple<uint32_t, uint32_t, uint32_t>;
     std::map<buffer_ref_key_t, std::string> buffer_references;
 
-    auto track_back_instruction = [&buffer_references, &spv_shader_module, &store_instructions, &decorations_instructions](
-                                      const Instruction* object_insn, uint32_t type_id) {
+    auto track_back_instruction = [&buffer_references, &spv_shader_module, &store_instructions,
+                                   &decorations_instructions](const Instruction* object_insn) {
         // keep track of access-chain
         std::vector<uint32_t> access_indices;
 
@@ -153,14 +153,26 @@ void Parse(const std::vector<uint32_t>& spirv) {
                     object_insn = FindDef(object_insn->Operand(0));
                     break;
                 case spv::OpAccessChain: {
-                    access_indices.clear();
-
+                    std::vector<uint32_t> indices;
                     for (uint32_t i = 1; i < object_insn->num_operands(); ++i) {
                         if (auto ins = FindDef(object_insn->Operand(i))) {
-                            // store resolved indices
-                            access_indices.push_back(ins->Operand(0));
+                            while (ins && ins->Opcode() == spv::OpLoad) {
+                                ins = FindDef(ins->Operand(0));
+                            }
+
+                            if (!ins) {
+                                break;
+                            }
+                            auto op_code = ins->Opcode();
+                            if (op_code == spv::OpConstant) {
+                                // store resolved indices
+                                indices.push_back(ins->Operand(0));
+                            }
                         }
                     }
+                    // insert new indices in front
+                    access_indices.insert(access_indices.begin(), indices.begin(), indices.end());
+
                     object_insn = FindDef(object_insn->Operand(0));
                     break;
                 }
@@ -193,9 +205,14 @@ void Parse(const std::vector<uint32_t>& spirv) {
                                         num_scalar_bytes *= member.traits.numeric.matrix.column_count;
                                         num_scalar_bytes *= member.traits.numeric.matrix.row_count;
                                         num_scalar_bytes = std::max(num_scalar_bytes, member.traits.numeric.matrix.stride);
-                                        num_scalar_bytes = std::max(num_scalar_bytes, member.traits.array.stride);
                                     } else if (member.op == SpvOpTypeForwardPointer) {
                                         num_scalar_bytes = sizeof(uint64_t);
+                                    } else if (member.op == SpvOpTypeArray) {
+                                        num_scalar_bytes = std::max(num_scalar_bytes, member.traits.array.stride);
+                                        assert(false);  // not handled
+                                    } else if (member.op == SpvOpTypeRuntimeArray) {
+                                        num_scalar_bytes = std::max(num_scalar_bytes, member.traits.array.stride);
+                                        assert(false);  // not handled
                                     }
                                     buffer_offset += num_scalar_bytes;
                                 }
@@ -203,7 +220,7 @@ void Parse(const std::vector<uint32_t>& spirv) {
                                 // follow access-chain
                                 td = td->members + idx;
                             }
-
+                            access_indices.clear();
                             assert(td->op == SpvOpTypeForwardPointer ||
                                    (td->op == SpvOpTypeInt && td->traits.numeric.scalar.width == 64));
 
@@ -258,9 +275,9 @@ void Parse(const std::vector<uint32_t>& spirv) {
             const Instruction* object_insn = FindVariableStoring(store_instructions, load_pointer_insn->ResultId());
             if (!object_insn) continue;
 
-            track_back_instruction(object_insn, type_pointer_insn->ResultId());
+            track_back_instruction(object_insn);
         } else if (load_pointer_insn && load_pointer_insn->Opcode() == spv::OpAccessChain) {
-            track_back_instruction(load_pointer_insn, type_pointer_insn->ResultId());
+            track_back_instruction(load_pointer_insn);
         }
     }
 
