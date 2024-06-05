@@ -236,12 +236,16 @@ void Parse(const std::vector<uint32_t>& spirv) {
                                 td = td->members + idx;
                                 access_chain_names.emplace_back(td->struct_member_name ? td->struct_member_name : "unknown");
                             }
-
                             access_indices.clear();
 
-                            // buffer-references traced back to either pointer-type or plain uin64_t
+                            if (td->op == SpvOpTypeRuntimeArray) {
+                                array_stride = td->traits.array.stride;
+                            }
+
+                            // buffer-references traced back to either pointer-type, uin64_t or arrays of those
                             assert(td->op == SpvOpTypeForwardPointer ||
-                                   (td->op == SpvOpTypeInt && td->traits.numeric.scalar.width == 64));
+                                   (td->op == SpvOpTypeInt && td->traits.numeric.scalar.width == 64) ||
+                                   td->op == SpvOpTypeRuntimeArray);
 
                             buffer_ref_key_t key = {binding_info->set, binding_info->binding, buffer_offset};
                             buffer_references[key].access_chain = access_chain_names;
