@@ -163,11 +163,7 @@ void Parse(const std::vector<uint32_t>& spirv) {
                     std::vector<uint32_t> indices;
                     for (uint32_t i = 1; i < object_insn->num_operands(); ++i) {
                         if (auto ins = FindDef(object_insn->Operand(i))) {
-                            while (ins && ins->Opcode() == spv::OpLoad) {
-                                ins = FindDef(ins->Operand(0));
-                            }
-
-                            if (ins && ins->Opcode() == spv::OpConstant) {
+                            if (ins->Opcode() == spv::OpConstant) {
                                 // store resolved indices
                                 indices.push_back(ins->Operand(0));
                             }
