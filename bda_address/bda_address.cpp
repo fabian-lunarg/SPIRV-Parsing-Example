@@ -185,86 +185,86 @@ void Parse(const std::vector<uint32_t>& spirv) {
                     if (storage_class == spv::StorageClassFunction) {
                         // When casting to a struct, can get a 2nd function variable, just keep following
                         object_insn = FindVariableStoring(store_instructions, object_insn->ResultId());
-                    } else if (auto binding_info = GetVariableDecorations(decorations_instructions, *object_insn)) {
-                        SpvReflectResult spv_result;
-                        const SpvReflectTypeDescription* td = nullptr;
+                    } else {
+                        if (auto binding_info = GetVariableDecorations(decorations_instructions, *object_insn)) {
+                            SpvReflectResult spv_result;
+                            const SpvReflectTypeDescription* td = nullptr;
 
-                        // access-chain starts with descriptor-binding root
-                        std::string root_name;
+                            // access-chain starts with descriptor-binding root
+                            std::string root_name;
 
-                        if (binding_info->push_constant_block) {
-                            const SpvReflectBlockVariable* block =
-                                spvReflectGetPushConstantBlock(spv_shader_module.get(), 0, &spv_result);
-                            td = block->type_description;
-                        } else {
-                            auto spv_descriptor_binding = spvReflectGetDescriptorBinding(
-                                spv_shader_module.get(), binding_info->binding, binding_info->set, &spv_result);
-                            td = spv_descriptor_binding->type_description;
-                            root_name = spv_descriptor_binding->name;
-                        }
-                        uint32_t buffer_offset = 0;
-                        uint32_t array_stride = 0;
+                            if (binding_info->push_constant_block) {
+                                const SpvReflectBlockVariable* block =
+                                    spvReflectGetPushConstantBlock(spv_shader_module.get(), 0, &spv_result);
+                                td = block->type_description;
+                            } else {
+                                auto spv_descriptor_binding = spvReflectGetDescriptorBinding(
+                                    spv_shader_module.get(), binding_info->binding, binding_info->set, &spv_result);
+                                td = spv_descriptor_binding->type_description;
+                                root_name = spv_descriptor_binding->name;
+                            }
+                            uint32_t buffer_offset = 0;
+                            uint32_t array_stride = 0;
 
-                        if (root_name.empty()) {
-                            // e.g. push-constant-block or anonymous uniform-block
-                            // store typename instead
-                            root_name = td->type_name ? "(" + std::string(td->type_name) + ")" : "";
-                        }
-                        std::vector<std::string> access_chain_names = {root_name};
+                            if (root_name.empty()) {
+                                // e.g. push-constant-block or anonymous uniform-block
+                                // store typename instead
+                                root_name = td->type_name ? "(" + std::string(td->type_name) + ")" : "";
+                            }
+                            std::vector<std::string> access_chain_names = {root_name};
 
-                        // follow access-chain
-                        for (uint32_t idx : access_indices) {
-                            assert(idx < td->member_count);
+                            // follow access-chain
+                            for (uint32_t idx : access_indices) {
+                                assert(idx < td->member_count);
 
-                            if (td->op == SpvOpTypeArray || td->op == SpvOpTypeRuntimeArray) {
+                                if (td->op == SpvOpTypeArray || td->op == SpvOpTypeRuntimeArray) {
+                                    array_stride = td->traits.array.stride;
+                                }
+
+                                // offset calculation
+                                for (uint32_t m = 0; m < idx; ++m) {
+                                    uint32_t num_scalar_bytes = 0;
+                                    const auto& member = td->members[m];
+                                    num_scalar_bytes = member.traits.numeric.scalar.width / 8;
+
+                                    if (member.op == SpvOpTypeVector) {
+                                        num_scalar_bytes *= member.traits.numeric.vector.component_count;
+                                    } else if (member.op == SpvOpTypeMatrix) {
+                                        num_scalar_bytes *= member.traits.numeric.matrix.column_count;
+                                        num_scalar_bytes *= member.traits.numeric.matrix.row_count;
+                                        num_scalar_bytes = std::max(num_scalar_bytes, member.traits.numeric.matrix.stride);
+                                    } else if (member.op == SpvOpTypeForwardPointer) {
+                                        num_scalar_bytes = sizeof(uint64_t);
+                                    } else if (member.op == SpvOpTypeArray) {
+                                        num_scalar_bytes = std::max(num_scalar_bytes, member.traits.array.stride);
+                                        assert(false);  // not handled
+                                    } else if (member.op == SpvOpTypeRuntimeArray) {
+                                        num_scalar_bytes = std::max(num_scalar_bytes, member.traits.array.stride);
+                                        assert(false);  // not handled
+                                    }
+                                    buffer_offset += num_scalar_bytes;
+                                }
+
+                                td = td->members + idx;
+                                access_chain_names.emplace_back(td->struct_member_name ? td->struct_member_name : "unknown");
+                            }
+                            access_indices.clear();
+
+                            if (td->op == SpvOpTypeRuntimeArray) {
                                 array_stride = td->traits.array.stride;
                             }
 
-                            // offset calculation
-                            for (uint32_t m = 0; m < idx; ++m) {
-                                uint32_t num_scalar_bytes = 0;
-                                const auto& member = td->members[m];
-                                num_scalar_bytes = member.traits.numeric.scalar.width / 8;
+                            // buffer-references traced back to either pointer-type, uin64_t or arrays of those
+                            assert(td->op == SpvOpTypeForwardPointer ||
+                                   (td->op == SpvOpTypeInt && td->traits.numeric.scalar.width == 64) ||
+                                   td->op == SpvOpTypeRuntimeArray);
 
-                                if (member.op == SpvOpTypeVector) {
-                                    num_scalar_bytes *= member.traits.numeric.vector.component_count;
-                                } else if (member.op == SpvOpTypeMatrix) {
-                                    num_scalar_bytes *= member.traits.numeric.matrix.column_count;
-                                    num_scalar_bytes *= member.traits.numeric.matrix.row_count;
-                                    num_scalar_bytes = std::max(num_scalar_bytes, member.traits.numeric.matrix.stride);
-                                } else if (member.op == SpvOpTypeForwardPointer) {
-                                    num_scalar_bytes = sizeof(uint64_t);
-                                } else if (member.op == SpvOpTypeArray) {
-                                    num_scalar_bytes = std::max(num_scalar_bytes, member.traits.array.stride);
-                                    assert(false);  // not handled
-                                } else if (member.op == SpvOpTypeRuntimeArray) {
-                                    num_scalar_bytes = std::max(num_scalar_bytes, member.traits.array.stride);
-                                    assert(false);  // not handled
-                                }
-                                buffer_offset += num_scalar_bytes;
-                            }
-
-                            td = td->members + idx;
-                            access_chain_names.emplace_back(td->struct_member_name ? td->struct_member_name : "unknown");
+                            buffer_ref_key_t key = {binding_info->set, binding_info->binding, buffer_offset};
+                            buffer_references[key].access_chain = access_chain_names;
+                            buffer_references[key].array_stride = array_stride;
                         }
-                        access_indices.clear();
-
-                        if (td->op == SpvOpTypeRuntimeArray) {
-                            array_stride = td->traits.array.stride;
-                        }
-
-                        // buffer-references traced back to either pointer-type, uin64_t or arrays of those
-                        assert(td->op == SpvOpTypeForwardPointer ||
-                               (td->op == SpvOpTypeInt && td->traits.numeric.scalar.width == 64) ||
-                               td->op == SpvOpTypeRuntimeArray);
-
-                        buffer_ref_key_t key = {binding_info->set, binding_info->binding, buffer_offset};
-                        buffer_references[key].access_chain = access_chain_names;
-                        buffer_references[key].array_stride = array_stride;
+                        object_insn = nullptr;
                     }
-
-                    object_insn = nullptr;
-
                     break;
                 }
                 default:
