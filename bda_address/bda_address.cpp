@@ -137,7 +137,12 @@ void Parse(const std::vector<uint32_t>& spirv) {
 
     // set/binding/offset
     using buffer_ref_key_t = std::tuple<uint32_t, uint32_t, uint32_t>;
-    std::map<buffer_ref_key_t, std::string> buffer_references;
+
+    struct buffer_reference_info_t {
+        std::vector<std::string> access_chain;
+        uint32_t array_stride = 0;
+    };
+    std::map<buffer_ref_key_t, buffer_reference_info_t> buffer_references;
 
     auto track_back_instruction = [&buffer_references, &spv_shader_module, &store_instructions,
                                    &decorations_instructions](const Instruction* object_insn) {
@@ -160,11 +165,7 @@ void Parse(const std::vector<uint32_t>& spirv) {
                                 ins = FindDef(ins->Operand(0));
                             }
 
-                            if (!ins) {
-                                break;
-                            }
-                            auto op_code = ins->Opcode();
-                            if (op_code == spv::OpConstant) {
+                            if (ins && ins->Opcode() == spv::OpConstant) {
                                 // store resolved indices
                                 indices.push_back(ins->Operand(0));
                             }
@@ -173,6 +174,7 @@ void Parse(const std::vector<uint32_t>& spirv) {
                     // insert new indices in front
                     access_indices.insert(access_indices.begin(), indices.begin(), indices.end());
 
+                    // continue with base object
                     object_insn = FindDef(object_insn->Operand(0));
                     break;
                 }
@@ -189,9 +191,23 @@ void Parse(const std::vector<uint32_t>& spirv) {
 
                             const SpvReflectTypeDescription* td = spv_descriptor_binding->type_description;
                             uint32_t buffer_offset = 0;
+                            uint32_t array_stride = 0;
 
-                            for (auto idx : access_indices) {
+                            // access-chain starts with descriptor-binding root
+                            std::string root_name = spv_descriptor_binding->name;
+                            if (root_name.empty()) {
+                                // e.g. anonymous uniform-block, store typename instead
+                                root_name = td->type_name ? "(" + std::string(td->type_name) + ")" : "";
+                            }
+                            std::vector<std::string> access_chain_names = {root_name};
+
+                            // follow access-chain
+                            for (uint32_t idx : access_indices) {
                                 assert(idx < td->member_count);
+
+                                if (td->op == SpvOpTypeArray || td->op == SpvOpTypeRuntimeArray) {
+                                    array_stride = td->traits.array.stride;
+                                }
 
                                 // offset calculation
                                 for (uint32_t m = 0; m < idx; ++m) {
@@ -217,15 +233,19 @@ void Parse(const std::vector<uint32_t>& spirv) {
                                     buffer_offset += num_scalar_bytes;
                                 }
 
-                                // follow access-chain
                                 td = td->members + idx;
+                                access_chain_names.emplace_back(td->struct_member_name ? td->struct_member_name : "unknown");
                             }
+
                             access_indices.clear();
+
+                            // buffer-references traced back to either pointer-type or plain uin64_t
                             assert(td->op == SpvOpTypeForwardPointer ||
                                    (td->op == SpvOpTypeInt && td->traits.numeric.scalar.width == 64));
 
                             buffer_ref_key_t key = {binding_info->set, binding_info->binding, buffer_offset};
-                            buffer_references[key] = td->struct_member_name;
+                            buffer_references[key].access_chain = access_chain_names;
+                            buffer_references[key].array_stride = array_stride;
                         }
                         object_insn = nullptr;
                     }
@@ -281,9 +301,16 @@ void Parse(const std::vector<uint32_t>& spirv) {
         }
     }
 
-    for (const auto& [key, name] : buffer_references) {
+    for (const auto& [key, ref_info] : buffer_references) {
         const auto& [set, binding, offset] = key;
-        printf("buffer-reference: %s (set: %u, binding: %u - buffer-offset: %u)\n", name.c_str(), set, binding, offset);
+        std::string name;
+        for (const auto& sn : ref_info.access_chain) {
+            name += sn + " -> ";
+        }
+        name = name.substr(0, name.size() - 4);
+
+        printf("buffer-reference: %s (set: %u, binding: %u, buffer-offset: %u, array-stride: %u)\n", name.c_str(), set, binding,
+               offset, ref_info.array_stride);
     }
 }
 
