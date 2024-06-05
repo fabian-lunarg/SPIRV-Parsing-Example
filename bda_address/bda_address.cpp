@@ -138,7 +138,7 @@ void Parse(const std::vector<uint32_t>& spirv) {
     std::vector<const Instruction*> decorations_instructions;
 
     // set/binding/offset
-    using buffer_ref_key_t = std::tuple<uint32_t, uint32_t, uint32_t>;
+    using buffer_ref_key_t = std::tuple<uint32_t, uint32_t, uint32_t, bool>;
 
     struct buffer_reference_info_t {
         std::vector<std::string> access_chain;
@@ -194,8 +194,8 @@ void Parse(const std::vector<uint32_t>& spirv) {
                             std::string root_name;
 
                             if (binding_info->push_constant_block) {
-                                const SpvReflectBlockVariable* block =
-                                    spvReflectGetPushConstantBlock(spv_shader_module.get(), 0, &spv_result);
+                                const SpvReflectBlockVariable* block = spvReflectGetEntryPointPushConstantBlock(
+                                    spv_shader_module.get(), spv_shader_module->entry_point_name, &spv_result);
                                 td = block->type_description;
                             } else {
                                 auto spv_descriptor_binding = spvReflectGetDescriptorBinding(
@@ -259,7 +259,8 @@ void Parse(const std::vector<uint32_t>& spirv) {
                                    (td->op == SpvOpTypeInt && td->traits.numeric.scalar.width == 64) ||
                                    td->op == SpvOpTypeRuntimeArray);
 
-                            buffer_ref_key_t key = {binding_info->set, binding_info->binding, buffer_offset};
+                            buffer_ref_key_t key = {binding_info->set, binding_info->binding, buffer_offset,
+                                                    binding_info->push_constant_block};
                             buffer_references[key].access_chain = access_chain_names;
                             buffer_references[key].array_stride = array_stride;
                         }
@@ -318,15 +319,22 @@ void Parse(const std::vector<uint32_t>& spirv) {
     }
 
     for (const auto& [key, ref_info] : buffer_references) {
-        const auto& [set, binding, offset] = key;
+        const auto& [set, binding, offset, push_constant_block] = key;
         std::string name;
         for (const auto& sn : ref_info.access_chain) {
             name += sn + " -> ";
         }
         name = name.substr(0, name.size() - 4);
 
-        printf("buffer-reference: %s (set: %u, binding: %u, buffer-offset: %u, array-stride: %u)\n", name.c_str(), set, binding,
-               offset, ref_info.array_stride);
+        char buf[128];
+        if (push_constant_block) {
+            sprintf(buf, "push-constant-block");
+        } else {
+            sprintf(buf, "set: %u, binding: %u", set, binding);
+        }
+
+        printf("buffer-reference: %s (%s, buffer-offset: %u, array-stride: %u)\n", name.c_str(), buf, offset,
+               ref_info.array_stride);
     }
 }
 
