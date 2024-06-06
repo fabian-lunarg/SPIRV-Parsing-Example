@@ -3,6 +3,7 @@ add_executable(bda_address)
 target_sources(bda_address PRIVATE
         bda_address.cpp
         spirv_reflect.c
+        spirv_parsing_util.cpp
 )
 
 target_include_directories(bda_address PRIVATE

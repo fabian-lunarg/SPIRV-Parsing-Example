@@ -1,6 +1,8 @@
 // This file can be generated from
 //   SPIRV-Headers/include/spirv/unified1/spirv.core.grammar.json
 
+#pragma once
+
 #include "spirv.hpp"
 
 static constexpr bool OpcodeHasType(uint32_t opcode) {
@@ -730,7 +732,7 @@ static constexpr bool OpcodeHasResult(uint32_t opcode) {
     }
 }
 
-const char* string_SpvOpcode(uint32_t opcode) {
+static const char* string_SpvOpcode(uint32_t opcode) {
     switch (opcode) {
         case spv::OpNop:
             return "OpNop";
