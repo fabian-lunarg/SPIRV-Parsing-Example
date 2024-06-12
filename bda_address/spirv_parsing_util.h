@@ -37,9 +37,8 @@ class SpirVParsingUtil
         uint32_t set                 = 0;
         uint32_t binding             = 0;
         bool     push_constant_block = false;
-
-        uint32_t buffer_offset = 0;
-        uint32_t array_stride  = 0;
+        uint32_t buffer_offset       = 0;
+        uint32_t array_stride        = 0;
     };
 
     SpirVParsingUtil() = default;
@@ -52,15 +51,14 @@ class SpirVParsingUtil
     class Instruction;
 
     const Instruction* FindDef(uint32_t id);
-    const Instruction* FindVariableStoring(std::vector<const Instruction*>& store_instructions, uint32_t variable_id);
+    const Instruction* FindVariableStoring(uint32_t variable_id);
     bool GetVariableDecorations(const Instruction* variable_insn, BufferReferenceInfo& buffer_reference_info);
 
-    // This is a LUT for hopping around instructions from a result ID
+    // LUT for hopping around instructions from a result ID
     std::unordered_map<uint32_t, const Instruction*> definitions_{};
 
-    std::vector<const Instruction*> store_instructions_{};
-    std::vector<const Instruction*> decorations_instructions_{};
-
+    std::vector<const Instruction*>                         store_instructions_{};
+    std::vector<const Instruction*>                         decorations_instructions_{};
     std::map<BufferReferenceInfo, std::vector<std::string>> buffer_reference_map_{};
 };
 

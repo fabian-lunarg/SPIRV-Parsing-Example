@@ -22,12 +22,12 @@
 
 #include <cassert>
 #include <functional>
+#include <optional>
 #include <memory>
 
 #include "spirv_parsing_util.h"
 #include "helper.h"
 #include "spirv_reflect.h"
-
 
 // used to enable type as key for std::set/map
 bool operator<(const SpirVParsingUtil::BufferReferenceInfo& lhs, const SpirVParsingUtil::BufferReferenceInfo& rhs)
@@ -107,10 +107,9 @@ const SpirVParsingUtil::Instruction* SpirVParsingUtil::FindDef(uint32_t id)
     return it->second;
 }
 
-const SpirVParsingUtil::Instruction*
-SpirVParsingUtil::FindVariableStoring(std::vector<const Instruction*>& store_instructions, uint32_t variable_id)
+const SpirVParsingUtil::Instruction* SpirVParsingUtil::FindVariableStoring(uint32_t variable_id)
 {
-    for (const Instruction* store_insn : store_instructions)
+    for (const Instruction* store_insn : store_instructions_)
     {
         if (store_insn->operand(0) == variable_id)
         {
@@ -136,7 +135,9 @@ bool SpirVParsingUtil::GetVariableDecorations(const Instruction*   variable_insn
     for (const Instruction* insn : decorations_instructions_)
     {
         if (insn->operand(0) != variable_id)
+        {
             continue;
+        }
         if (insn->operand(1) == spv::DecorationDescriptorSet)
         {
             buffer_reference_info.set = insn->operand(2);
@@ -158,9 +159,12 @@ bool SpirVParsingUtil::GetVariableDecorations(const Instruction*   variable_insn
     }
 }
 
-bool SpirVParsingUtil::Parse(const uint32_t* spirv_code, size_t spirv_num_bytes)
+bool SpirVParsingUtil::Parse(const uint32_t* const spirv_code, size_t spirv_num_bytes)
 {
-    assert(spirv_code != nullptr);
+    if (spirv_code == nullptr)
+    {
+        return false;
+    }
 
     definitions_.clear();
     store_instructions_.clear();
@@ -168,29 +172,28 @@ bool SpirVParsingUtil::Parse(const uint32_t* spirv_code, size_t spirv_num_bytes)
     buffer_reference_map_.clear();
 
     // use in combination with spirv-reflect
-    std::unique_ptr<SpvReflectShaderModule, std::function<void(SpvReflectShaderModule*)>> spv_shader_module = {
-        new SpvReflectShaderModule, spvReflectDestroyShaderModule
-    };
-
-    spvReflectCreateShaderModule(spirv_num_bytes, spirv_code, spv_shader_module.get());
+    std::optional<SpvReflectShaderModule> spv_shader_module;
 
     // spirv-header is 5 d-words
     constexpr uint32_t spirv_header_size = 5;
+    const uint32_t*    spirv_ptr         = spirv_code;
     const uint32_t*    spirv_end         = spirv_code + (spirv_num_bytes / sizeof(uint32_t));
 
     // skip header
-    spirv_code += spirv_header_size;
+    spirv_ptr += spirv_header_size;
 
     std::vector<Instruction> instructions;
+
     // First build up instructions object to make it easier to work with the SPIR-V
-    while (spirv_code != spirv_end)
+    while (spirv_ptr != spirv_end)
     {
-        Instruction& insn = instructions.emplace_back(spirv_code);
-        spirv_code += insn.length();
+        Instruction& insn = instructions.emplace_back(spirv_ptr);
+        spirv_ptr += insn.length();
     }
     instructions.shrink_to_fit();
 
-    auto track_back_instruction = [this, &spv_shader_module](const Instruction* object_insn) {
+    auto track_back_instruction = [this, &spv_shader_module, spirv_code, spirv_num_bytes](
+                                      const Instruction* object_insn) {
         // keep track of access-chain
         std::vector<uint32_t> access_indices;
 
@@ -231,10 +234,17 @@ bool SpirVParsingUtil::Parse(const uint32_t* spirv_code, size_t spirv_num_bytes)
                     if (storage_class == spv::StorageClassFunction)
                     {
                         // When casting to a struct, can get a 2nd function variable, just keep following
-                        object_insn = FindVariableStoring(store_instructions_, object_insn->resultId());
+                        object_insn = FindVariableStoring(object_insn->resultId());
                     }
                     else
                     {
+                        if (!spv_shader_module)
+                        {
+                            // spirv-reflect parsing only on-demand
+                            spv_shader_module = SpvReflectShaderModule();
+                            spvReflectCreateShaderModule(spirv_num_bytes, spirv_code, &spv_shader_module.value());
+                        }
+
                         BufferReferenceInfo buffer_reference_info = {};
 
                         if (GetVariableDecorations(object_insn, buffer_reference_info))
@@ -248,13 +258,13 @@ bool SpirVParsingUtil::Parse(const uint32_t* spirv_code, size_t spirv_num_bytes)
                             if (buffer_reference_info.push_constant_block)
                             {
                                 const SpvReflectBlockVariable* block = spvReflectGetEntryPointPushConstantBlock(
-                                    spv_shader_module.get(), spv_shader_module->entry_point_name, &spv_result);
+                                    &spv_shader_module.value(), spv_shader_module->entry_point_name, &spv_result);
                                 td = block->type_description;
                             }
                             else
                             {
-                                auto spv_descriptor_binding =
-                                    spvReflectGetDescriptorBinding(spv_shader_module.get(),
+                                const SpvReflectDescriptorBinding* spv_descriptor_binding =
+                                    spvReflectGetDescriptorBinding(&spv_shader_module.value(),
                                                                    buffer_reference_info.binding,
                                                                    buffer_reference_info.set,
                                                                    &spv_result);
@@ -273,51 +283,58 @@ bool SpirVParsingUtil::Parse(const uint32_t* spirv_code, size_t spirv_num_bytes)
                             // follow access-chain
                             for (uint32_t idx : access_indices)
                             {
-                                assert(idx < td->member_count);
-
-                                if (td->op == SpvOpTypeArray || td->op == SpvOpTypeRuntimeArray)
+                                if (idx < td->member_count)
                                 {
-                                    buffer_reference_info.array_stride = td->traits.array.stride;
-                                }
+                                    if (td->op == SpvOpTypeArray || td->op == SpvOpTypeRuntimeArray)
+                                    {
+                                        buffer_reference_info.array_stride = td->traits.array.stride;
+                                    }
 
-                                // offset calculation
-                                for (uint32_t m = 0; m < idx; ++m)
+                                    // offset calculation
+                                    for (uint32_t m = 0; m < idx; ++m)
+                                    {
+                                        uint32_t    num_scalar_bytes = 0;
+                                        const auto& member           = td->members[m];
+                                        num_scalar_bytes             = member.traits.numeric.scalar.width / 8;
+
+                                        if (member.op == SpvOpTypeVector)
+                                        {
+                                            num_scalar_bytes *= member.traits.numeric.vector.component_count;
+                                        }
+                                        else if (member.op == SpvOpTypeMatrix)
+                                        {
+                                            num_scalar_bytes *= member.traits.numeric.matrix.column_count;
+                                            num_scalar_bytes *= member.traits.numeric.matrix.row_count;
+                                            num_scalar_bytes =
+                                                std::max(num_scalar_bytes, member.traits.numeric.matrix.stride);
+                                        }
+                                        else if (member.op == SpvOpTypeForwardPointer)
+                                        {
+                                            num_scalar_bytes = sizeof(uint64_t);
+                                        }
+                                        else if (member.op == SpvOpTypeArray)
+                                        {
+                                            num_scalar_bytes = std::max(num_scalar_bytes, member.traits.array.stride);
+                                            assert(false); // not handled
+                                        }
+                                        else if (member.op == SpvOpTypeRuntimeArray)
+                                        {
+                                            num_scalar_bytes = std::max(num_scalar_bytes, member.traits.array.stride);
+                                            assert(false); // not handled
+                                        }
+                                        buffer_reference_info.buffer_offset += num_scalar_bytes;
+                                    }
+
+                                    td = td->members + idx;
+                                    access_chain_names.emplace_back(td->struct_member_name ? td->struct_member_name
+                                                                                           : "unknown");
+                                }
+                                else
                                 {
-                                    uint32_t    num_scalar_bytes = 0;
-                                    const auto& member           = td->members[m];
-                                    num_scalar_bytes             = member.traits.numeric.scalar.width / 8;
-
-                                    if (member.op == SpvOpTypeVector)
-                                    {
-                                        num_scalar_bytes *= member.traits.numeric.vector.component_count;
-                                    }
-                                    else if (member.op == SpvOpTypeMatrix)
-                                    {
-                                        num_scalar_bytes *= member.traits.numeric.matrix.column_count;
-                                        num_scalar_bytes *= member.traits.numeric.matrix.row_count;
-                                        num_scalar_bytes =
-                                            std::max(num_scalar_bytes, member.traits.numeric.matrix.stride);
-                                    }
-                                    else if (member.op == SpvOpTypeForwardPointer)
-                                    {
-                                        num_scalar_bytes = sizeof(uint64_t);
-                                    }
-                                    else if (member.op == SpvOpTypeArray)
-                                    {
-                                        num_scalar_bytes = std::max(num_scalar_bytes, member.traits.array.stride);
-                                        assert(false); // not handled
-                                    }
-                                    else if (member.op == SpvOpTypeRuntimeArray)
-                                    {
-                                        num_scalar_bytes = std::max(num_scalar_bytes, member.traits.array.stride);
-                                        assert(false); // not handled
-                                    }
-                                    buffer_reference_info.buffer_offset += num_scalar_bytes;
+                                    printf("Access-chain index is out-of-bounds for op: %s\n",
+                                                         string_SpvOpcode(td->op));
+                                    return;
                                 }
-
-                                td = td->members + idx;
-                                access_chain_names.emplace_back(td->struct_member_name ? td->struct_member_name
-                                                                                       : "unknown");
                             }
                             access_indices.clear();
 
@@ -327,11 +344,18 @@ bool SpirVParsingUtil::Parse(const uint32_t* spirv_code, size_t spirv_num_bytes)
                             }
 
                             // buffer-references traced back to either pointer-type, uin64_t or arrays of those
-                            assert(td->op == SpvOpTypeForwardPointer ||
-                                            (td->op == SpvOpTypeInt && td->traits.numeric.scalar.width == 64) ||
-                                            td->op == SpvOpTypeRuntimeArray);
-
-                            buffer_reference_map_[buffer_reference_info] = access_chain_names;
+                            if (td->op == SpvOpTypeForwardPointer ||
+                                (td->op == SpvOpTypeInt && td->traits.numeric.scalar.width == 64) ||
+                                td->op == SpvOpTypeRuntimeArray)
+                            {
+                                buffer_reference_map_[buffer_reference_info] = access_chain_names;
+                            }
+                            else
+                            {
+                                printf(
+                                    "Traced back a potential buffer-reference, but type does not match: %s\n",
+                                    string_SpvOpcode(td->op));
+                            }
                         }
                         object_insn = nullptr;
                     }
@@ -339,7 +363,7 @@ bool SpirVParsingUtil::Parse(const uint32_t* spirv_code, size_t spirv_num_bytes)
                 }
                 default:
                     printf("Failed to track back the Function Variable OpStore, hit a %s\n",
-                           string_SpvOpcode(object_insn->opcode()));
+                                         string_SpvOpcode(object_insn->opcode()));
                     object_insn = nullptr;
                     break;
             }
@@ -386,7 +410,7 @@ bool SpirVParsingUtil::Parse(const uint32_t* spirv_code, size_t spirv_num_bytes)
         if (load_pointer_insn && load_pointer_insn->opcode() == spv::OpVariable &&
             load_pointer_insn->operand(0) == spv::StorageClassFunction)
         {
-            const Instruction* object_insn = FindVariableStoring(store_instructions_, load_pointer_insn->resultId());
+            const Instruction* object_insn = FindVariableStoring(load_pointer_insn->resultId());
             if (!object_insn)
             {
                 continue;
@@ -412,19 +436,26 @@ bool SpirVParsingUtil::Parse(const uint32_t* spirv_code, size_t spirv_num_bytes)
         char buf[128];
         if (buffer_reference_info.push_constant_block)
         {
-            sprintf(buf, "push-constant-block");
+            snprintf(buf, sizeof(buf), "push-constant-block");
         }
         else
         {
-            sprintf(buf, "set: %u, binding: %u", buffer_reference_info.set, buffer_reference_info.binding);
+            snprintf(
+                buf, sizeof(buf), "set: %u, binding: %u", buffer_reference_info.set, buffer_reference_info.binding);
         }
 
         printf("buffer-reference: %s (%s, buffer-offset: %u, array-stride: %u)\n",
-               name.c_str(),
-               buf,
-               buffer_reference_info.buffer_offset,
-               buffer_reference_info.array_stride);
+                           name.c_str(),
+                           buf,
+                           buffer_reference_info.buffer_offset,
+                           buffer_reference_info.array_stride);
     }
+    // cleanup spirv-module
+    if(spv_shader_module)
+    {
+        spvReflectDestroyShaderModule(&spv_shader_module.value());
+    }
+
     // successfully parsed
     return true;
 }
