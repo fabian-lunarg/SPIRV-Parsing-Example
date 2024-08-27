@@ -32,7 +32,7 @@ int main(int argc, char** argv) {
     auto start_time = std::chrono::high_resolution_clock::now();
 
     SpirVParsingUtil parsing_util;
-    parsing_util.Parse(spirv.data(), spirv.size() * sizeof(uint32_t));
+    parsing_util.ParseBufferReferences(spirv.data(), spirv.size() * sizeof(uint32_t));
 
     auto end_time = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> duration = end_time - start_time;
